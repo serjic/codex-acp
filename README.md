@@ -59,7 +59,8 @@ npx -y @agentclientprotocol/codex-acp@preview
 
 The adapter advertises ACP auth methods during initialization. Clients can authenticate with:
 
-- ChatGPT login. Set `NO_BROWSER=1` to hide this method in remote or browserless environments.
+- ChatGPT login when the client does not report `user-colocated=false`. `NO_BROWSER=1` also hides this method.
+- ChatGPT device-code login when the client supports URL elicitation.
 - API key via `CODEX_API_KEY` or `OPENAI_API_KEY`.
 - A custom OpenAI-compatible gateway, when the client opts in to the gateway auth capability.
 

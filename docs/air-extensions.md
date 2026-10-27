@@ -292,6 +292,17 @@ AIR stores `rawOutput` text as an output stream and moves a large one to a file.
 
 This adapter offers no `terminal-auth` authentication method.
 
+## User colocation
+
+AIR sends `clientCapabilities._meta["user-colocated"]` during initialization.
+A value of `false` means that the user does not share the agent's environment.
+The adapter then omits browser-based ChatGPT login in both ACP versions.
+An absent key preserves browser login for existing clients. `NO_BROWSER` also disables browser login.
+Colocation does not guarantee that a browser can start in a headless environment.
+
+Device-code login requires URL elicitation. Each login waits for its own Codex `loginId`.
+An old or unrelated completion cannot finish another login. API-key login uses the separate completion without an ID.
+
 ## Tool call contract
 
 AIR gets this contract. Each fact goes in exactly one field.

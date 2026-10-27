@@ -33,7 +33,6 @@ import {sanitizeMcpServerName} from "./McpServerName";
 import {listedSessionTitle} from "./SessionTitle";
 import {type AcpMcpServer, type WithAcpMcpServers, getMcpServerName, normalizeMcpServer, toCodexMcpServerConfig} from "./McpServerConfig";
 import type {
-    AccountLoginCompletedNotification,
     AccountUpdatedNotification,
     GetAccountRateLimitsResponse,
     GetAccountResponse,
@@ -84,6 +83,7 @@ import {
     narrowToListedModels,
 } from "./GatewayModelDiscovery";
 import {findSupportedEffort} from "./ModelConfigOption";
+import {CodexLoginCompletions, type CodexLoginCompletion} from "./CodexLoginCompletions";
 import {disableUnsupportedSkills, withoutUnsupportedSkills} from "./UnsupportedSkills";
 export type {SessionMetadata, SessionMetadataWithThread} from "./SessionMetadata";
 /** A null turn marks unavailable outcome metadata, not a failed turn. */
@@ -154,6 +154,7 @@ export class CodexAcpClient {
     private readonly codexClient: CodexAppServerClient;
     private readonly config: JsonObject;
     private readonly modelProvider: string | null;
+    private readonly loginCompletions: CodexLoginCompletions;
     private gatewayConfig: GatewayConfig | null;
     /**
      * Where the stored gateway routing came from: the `gateway` auth method
@@ -161,7 +162,6 @@ export class CodexAcpClient {
      * routing). `authStatus` reports only the agent-owned one.
      */
     private gatewayConfigSource: GatewayConfigSource | null;
-    private pendingLoginCompleted: Promise<AccountLoginCompletedNotification> | null = null;
     private pendingAccountUpdated: Promise<AccountUpdatedNotification> | null = null;
     private readonly sessionNotificationQueues = new Map<string, Promise<void>>();
     private readonly subagents: CodexSubagentSubscriptions;
@@ -173,6 +173,7 @@ export class CodexAcpClient {
         this.codexClient = codexClient;
         this.config = codexConfig ?? {};
         this.modelProvider = modelProvider ?? null;
+        this.loginCompletions = new CodexLoginCompletions(codexClient);
         this.gatewayConfig = null;
         this.gatewayConfigSource = null;
         this.subagents = new CodexSubagentSubscriptions(codexClient);
@@ -252,28 +253,37 @@ export class CodexAcpClient {
 
     private async authenticateWithApiKey(authRequest: ApiKeyAuthRequest): Promise<Boolean> {
         const apiKey = authRequest._meta?.["api-key"]?.apiKey ?? this.readApiKeyFromEnv();
-        const loginCompletedPromise = this.awaitNextLoginCompleted();
-        loginCompletedPromise.catch(() => {});
-        await this.codexClient.accountLogin({
-            type: "apiKey",
-            apiKey,
-        });
-        const result = await loginCompletedPromise;
-        return result.success;
+        const completion = this.loginCompletions.begin();
+        let loginId: string | null = null;
+        try {
+            const response = await this.codexClient.accountLogin({type: "apiKey", apiKey});
+            loginId = "loginId" in response ? response.loginId : null;
+            if (response.type !== "apiKey") return false;
+            completion.select(null);
+            return (await completion.result).success;
+        } finally {
+            completion.dispose();
+            await this.cancelUnfinishedLogin(loginId, completion);
+        }
     }
 
     private async authenticateWithChatGpt(): Promise<Boolean> {
         if (await this.hasWorkingChatGptLogin()) {
             return true;
         }
-        const loginCompletedPromise = this.awaitNextLoginCompleted();
-        loginCompletedPromise.catch(() => {});
-        const loginResponse = await this.codexClient.accountLogin({type: "chatgpt"});
-        if (loginResponse.type == "chatgpt") {
-            await open(loginResponse.authUrl);
+        const completion = this.loginCompletions.begin();
+        let loginId: string | null = null;
+        try {
+            const response = await this.codexClient.accountLogin({type: "chatgpt"});
+            loginId = "loginId" in response ? response.loginId : null;
+            if (response.type !== "chatgpt") return false;
+            completion.select(response.loginId);
+            await open(response.authUrl);
+            return (await completion.result).success;
+        } finally {
+            completion.dispose();
+            await this.cancelUnfinishedLogin(loginId, completion);
         }
-        const result = await loginCompletedPromise;
-        return result.success;
     }
 
     /**
@@ -308,20 +318,23 @@ export class CodexAcpClient {
         if (!urlElicitationRequester) {
             throw RequestError.invalidRequest(undefined, "Device code authentication requires URL elicitation support");
         }
-        const loginCompletedPromise = this.awaitNextLoginCompleted();
-        loginCompletedPromise.catch(() => {});
-        const loginResponse = await this.codexClient.accountLogin({type: "chatgptDeviceCode"});
-        if (loginResponse.type !== "chatgptDeviceCode") {
-            return false;
-        }
-        const elicitationResponsePromise = Promise.resolve(urlElicitationRequester.elicitUrl({
-            url: loginResponse.verificationUrl,
-            message: `Sign in to ChatGPT and enter this code: ${loginResponse.userCode}`,
-            elicitationId: loginResponse.loginId,
-        }));
+        const completion = this.loginCompletions.begin();
+        let loginId: string | null = null;
+        let elicitationPending = false;
+        let failed = false;
         try {
+            const loginResponse = await this.codexClient.accountLogin({type: "chatgptDeviceCode"});
+            loginId = "loginId" in loginResponse ? loginResponse.loginId : null;
+            if (loginResponse.type !== "chatgptDeviceCode") return false;
+            completion.select(loginResponse.loginId);
+            elicitationPending = true;
+            const elicitationResponsePromise = Promise.resolve(urlElicitationRequester.elicitUrl({
+                url: loginResponse.verificationUrl,
+                message: `Sign in to ChatGPT and enter this code: ${loginResponse.userCode}`,
+                elicitationId: loginResponse.loginId,
+            }));
             const first = await Promise.race([
-                loginCompletedPromise.then(result => ({
+                completion.result.then(result => ({
                     type: "loginCompleted" as const,
                     result,
                 })),
@@ -332,27 +345,41 @@ export class CodexAcpClient {
             ]);
 
             if (first.type === "loginCompleted") {
-                await urlElicitationRequester.completeElicitation();
                 return first.result.success;
             }
 
             if (!acp.CreateElicitationResponse.isAccept(first.response)) {
-                await this.codexClient.accountLoginCancel({loginId: loginResponse.loginId});
+                elicitationPending = false;
                 throw RequestError.requestCancelled(
                     {methodId: "chat-gpt-device-code", action: first.response.action},
                     "ChatGPT device code sign-in was cancelled",
                 );
             }
 
-            const result = await loginCompletedPromise;
-            await urlElicitationRequester.completeElicitation();
-            return result.success;
+            return (await completion.result).success;
         } catch (error) {
-            // A lost app-server ends the login: the open URL elicitation must not stay open in the client.
-            if (this.codexClient.connectionLoss.lost) {
-                await Promise.resolve(urlElicitationRequester.completeElicitation()).catch(() => {});
-            }
+            failed = true;
             throw error;
+        } finally {
+            completion.dispose();
+            await this.cancelUnfinishedLogin(loginId, completion);
+            if (elicitationPending) {
+                try {
+                    await urlElicitationRequester.completeElicitation();
+                } catch (error) {
+                    if (!failed) throw error;
+                    logger.error("Failed to close the account login elicitation", error);
+                }
+            }
+        }
+    }
+
+    private async cancelUnfinishedLogin(loginId: string | null, completion: CodexLoginCompletion): Promise<void> {
+        if (loginId === null || completion.completed || this.codexClient.connectionLoss.lost) return;
+        try {
+            await this.codexClient.accountLoginCancel({loginId});
+        } catch (error) {
+            logger.error("Failed to cancel the unfinished account login", error);
         }
     }
 
@@ -1377,21 +1404,6 @@ export class CodexAcpClient {
 
     async listSkills(params?: SkillsListParams): Promise<SkillsListResponse> {
         return withoutUnsupportedSkills(await this.codexClient.listSkills(params ?? {}));
-    }
-
-    private async awaitNextLoginCompleted(): Promise<AccountLoginCompletedNotification> {
-        if (this.pendingLoginCompleted !== null) {
-            return await this.pendingLoginCompleted;
-        }
-        this.pendingLoginCompleted = this.awaitSingleNotification(
-            "account/login/completed",
-            (event: AccountLoginCompletedNotification) => event,
-        );
-        try {
-            return await this.pendingLoginCompleted;
-        } finally {
-            this.pendingLoginCompleted = null;
-        }
     }
 
     private async awaitNextAccountUpdated(): Promise<AccountUpdatedNotification> {
